@@ -27,6 +27,11 @@ class MmpSmsAdapter(BasePlatformAdapter):
 
     interactive_resume = False
 
+    @property
+    def authorization_is_upstream(self) -> bool:
+        """LAN IP allowlist in POST /webhook already gated the request."""
+        return True
+
     def __init__(self, config: PlatformConfig, **kwargs: Any):
         super().__init__(config=config, platform=Platform("mmp_sms"))
         extra = getattr(config, "extra", {}) or {}
@@ -84,6 +89,9 @@ class MmpSmsAdapter(BasePlatformAdapter):
             logger.info("[mmp-sms] WhatsApp unavailable; logging reply: %s", content[:200])
             return SendResult(success=True)
         return await wa.send(target, content, reply_to=reply_to, metadata=metadata)
+
+    async def get_chat_info(self, chat_id: str) -> dict[str, Any]:
+        return {"name": chat_id, "type": "webhook"}
 
     async def _handle_health(self, request: web.Request) -> web.Response:
         return web.json_response({"status": "ok", "platform": "mmp_sms"})
