@@ -361,6 +361,9 @@ class MmpSmsWebhookProcessor:
             self._prune(pending, datetime.now(timezone.utc))
             for existing in pending.values():
                 if existing.get("fingerprint") == fingerprint:
+                    if existing.get("status") in {"pending", "needs_review"}:
+                        existing["status"] = "queued_for_agent"
+                        self._write_pending(pending)
                     return existing
             pending[candidate_id] = candidate
             self._write_pending(pending)
