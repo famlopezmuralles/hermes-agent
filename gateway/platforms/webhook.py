@@ -64,7 +64,6 @@ from gateway.platforms.webhook_filters import (
     WebhookRouteProcessor,
 )
 from gateway.response_filters import is_autonomous_silence_response
-from gateway.mmp_sms_webhook import MmpSmsWebhookProcessor
 
 logger = logging.getLogger(__name__)
 
@@ -241,14 +240,6 @@ class WebhookAdapter(BasePlatformAdapter):
         self._route_processor = WebhookRouteProcessor(
             script_timeout_seconds=self._script_timeout_seconds
         )
-        mmp_sms_config = config.extra.get("mmp_sms", {})
-        self._mmp_sms_processor = (
-            MmpSmsWebhookProcessor(mmp_sms_config)
-            if isinstance(mmp_sms_config, dict) and mmp_sms_config.get("enabled", False)
-            else None
-        )
-        self._mmp_sms_batch: list = []
-        self._mmp_sms_flush_task = None
 
     # ------------------------------------------------------------------
     # Lifecycle
@@ -297,8 +288,6 @@ class WebhookAdapter(BasePlatformAdapter):
         # Content-Length and would otherwise bypass the header check below.
         app = web.Application(client_max_size=self._max_body_bytes)
         app.router.add_get("/health", self._handle_health)
-        if self._mmp_sms_processor is not None:
-            app.router.add_post("/webhook", self._handle_mmp_sms_webhook)
         app.router.add_post("/webhooks/{route_name}", self._handle_webhook)
         # Multi-profile multiplexing: a /p/<profile>/webhooks/<route> prefix
         # routes the inbound event to that profile. Same handler; the profile is
@@ -513,99 +502,6 @@ class WebhookAdapter(BasePlatformAdapter):
     async def _handle_health(self, request: "web.Request") -> "web.Response":
         """GET /health — simple health check."""
         return web.json_response({"status": "ok", "platform": "webhook"})
-
-    async def _handle_mmp_sms_webhook(self, request: "web.Request") -> "web.Response":
-        """POST /webhook — LAN SMS capture for MoneyManagerPlus.
-
-        Contract validation and candidate parsing run in a background task. The
-        HTTP response is deliberately immediate: Termux has a five-second
-        timeout, while WhatsApp delivery and all later accounting work are
-        independent of the POST request.
-        """
-        processor = self._mmp_sms_processor
-        if processor is None:
-            return web.json_response({"error": "MMP SMS webhook disabled"}, status=404)
-        remote = request.remote or ""
-        if not processor.accepts_ip(remote):
-            logger.warning("[mmp-sms] rejected source IP %s", remote)
-            return web.json_response({"error": "Source IP not allowed"}, status=403)
-        if (request.content_length or 0) > self._max_body_bytes:
-            return web.json_response({"error": "Payload too large"}, status=413)
-        try:
-            payload = await request.json()
-        except Exception:
-            return web.json_response({"error": "Invalid JSON"}, status=400)
-
-        async def _process() -> None:
-            try:
-                raw = await asyncio.to_thread(processor.ingest_raw, payload)
-                if raw.get("status") != "queued_for_agent":
-                    logger.info("[mmp-sms] skip dispatch id=%s status=%s", raw.get("id"), raw.get("status"))
-                    return
-                self._mmp_sms_batch.append(raw)
-                if self._mmp_sms_flush_task is not None:
-                    self._mmp_sms_flush_task.cancel()
-                task = asyncio.create_task(self._flush_mmp_sms_batch())
-                self._mmp_sms_flush_task = task
-                self._background_tasks.add(task)
-                task.add_done_callback(self._background_tasks.discard)
-            except Exception:
-                logger.exception("[mmp-sms] asynchronous SMS processing failed")
-
-        task = asyncio.create_task(_process())
-        self._background_tasks.add(task)
-        task.add_done_callback(self._background_tasks.discard)
-        return web.json_response({"ok": True}, status=200)
-
-    async def _flush_mmp_sms_batch(self) -> None:
-        """Debounce a Termux poll burst into one LLM turn."""
-        try:
-            await asyncio.sleep(8)
-        except asyncio.CancelledError:
-            return
-        processor = self._mmp_sms_processor
-        items = list(self._mmp_sms_batch)
-        self._mmp_sms_batch = []
-        self._mmp_sms_flush_task = None
-        if not items or processor is None:
-            return
-        try:
-            await self._dispatch_mmp_sms_to_agent(items)
-        except Exception:
-            logger.exception("[mmp-sms] LLM dispatch failed ids=%s", [i.get("id") for i in items])
-
-    async def _dispatch_mmp_sms_to_agent(self, items: list) -> None:
-        processor = self._mmp_sms_processor
-        prompt = processor.llm_prompt(items)
-        delivery_id = items[0]["id"] if len(items) == 1 else f"batch-{items[-1]['id']}"
-        session_chat_id = f"webhook:mmp-sms:{delivery_id}"
-        now = time.time()
-        chat_id = processor.chat_id
-        extra = {"chat_id": chat_id} if chat_id else {}
-        self._delivery_info[session_chat_id] = {
-            "deliver": "whatsapp",
-            "deliver_extra": extra,
-        }
-        self._delivery_info_created[session_chat_id] = now
-        self._delivery_info_order.append((now, session_chat_id))
-        self._prune_delivery_info(now)
-        source = self.build_source(
-            chat_id=session_chat_id,
-            chat_name="webhook/mmp-sms",
-            chat_type="webhook",
-            user_id="webhook:mmp-sms",
-            user_name="mmp-sms",
-        )
-        event = MessageEvent(
-            text=prompt,
-            message_type=MessageType.TEXT,
-            source=source,
-            raw_message={"items": items},
-            message_id=delivery_id,
-        )
-        logger.info("[mmp-sms] dispatching %d SMS to LLM delivery=%s", len(items), delivery_id)
-        await self.handle_message(event)
-        await asyncio.to_thread(processor.mark_agent_dispatched, [i["id"] for i in items])
 
     def _reload_dynamic_routes(self) -> None:
         """Reload agent-created subscriptions from disk if the file changed."""

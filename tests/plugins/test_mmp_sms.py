@@ -6,8 +6,8 @@ from types import SimpleNamespace
 import aiohttp
 
 from gateway.config import PlatformConfig
-from gateway.mmp_sms_webhook import MmpSmsWebhookProcessor, format_budget_status
-from gateway.platforms.webhook import WebhookAdapter
+from plugins.platforms.mmp_sms.adapter import MmpSmsAdapter
+from plugins.platforms.mmp_sms.processor import MmpSmsWebhookProcessor, format_budget_status
 
 
 def _copy_repo(tmp_path: Path) -> Path:
@@ -142,23 +142,14 @@ def test_aiohttp_route_returns_200_and_queues_preview(tmp_path):
             "extra": {
                 "host": "127.0.0.1",
                 "port": 0,
-                "mmp_sms": {
-                    "enabled": True,
-                    "mmp_repo": str(repo),
-                    "pending_path": str(tmp_path / "pending.json"),
-                    "allowed_ips": ["127.0.0.1"],
-                },
+                "mmp_repo": str(repo),
+                "pending_path": str(tmp_path / "pending.json"),
+                "allowed_ips": ["127.0.0.1"],
             },
         }
     )
-    adapter = WebhookAdapter(config)
+    adapter = MmpSmsAdapter(config)
     adapter.gateway_runner = SimpleNamespace(adapters={})
-    sent = []
-
-    async def fake_preview(candidate, runner):
-        sent.append(candidate["id"])
-
-    adapter._mmp_sms_processor.send_preview = fake_preview
 
     async def exercise():
         assert await adapter.connect() is True
@@ -171,7 +162,7 @@ def test_aiohttp_route_returns_200_and_queues_preview(tmp_path):
         await adapter.disconnect()
 
     asyncio.run(exercise())
-    pending = adapter._mmp_sms_processor._read_pending()
+    pending = adapter._processor._read_pending()
     assert pending
     candidate = next(iter(pending.values()))
     assert candidate.get("status") == "queued_for_agent"
