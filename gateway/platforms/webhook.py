@@ -64,6 +64,7 @@ from gateway.platforms.webhook_filters import (
     WebhookRouteProcessor,
 )
 from gateway.response_filters import is_autonomous_silence_response
+from gateway.mmp_sms_webhook import MmpSmsWebhookProcessor
 
 logger = logging.getLogger(__name__)
 
@@ -240,6 +241,12 @@ class WebhookAdapter(BasePlatformAdapter):
         self._route_processor = WebhookRouteProcessor(
             script_timeout_seconds=self._script_timeout_seconds
         )
+        mmp_sms_config = config.extra.get("mmp_sms", {})
+        self._mmp_sms_processor = (
+            MmpSmsWebhookProcessor(mmp_sms_config)
+            if isinstance(mmp_sms_config, dict) and mmp_sms_config.get("enabled", False)
+            else None
+        )
 
     # ------------------------------------------------------------------
     # Lifecycle
@@ -288,6 +295,8 @@ class WebhookAdapter(BasePlatformAdapter):
         # Content-Length and would otherwise bypass the header check below.
         app = web.Application(client_max_size=self._max_body_bytes)
         app.router.add_get("/health", self._handle_health)
+        if self._mmp_sms_processor is not None:
+            app.router.add_post("/webhook", self._handle_mmp_sms_webhook)
         app.router.add_post("/webhooks/{route_name}", self._handle_webhook)
         # Multi-profile multiplexing: a /p/<profile>/webhooks/<route> prefix
         # routes the inbound event to that profile. Same handler; the profile is
@@ -502,6 +511,44 @@ class WebhookAdapter(BasePlatformAdapter):
     async def _handle_health(self, request: "web.Request") -> "web.Response":
         """GET /health — simple health check."""
         return web.json_response({"status": "ok", "platform": "webhook"})
+
+    async def _handle_mmp_sms_webhook(self, request: "web.Request") -> "web.Response":
+        """POST /webhook — LAN SMS capture for MoneyManagerPlus.
+
+        Contract validation and candidate parsing run in a background task. The
+        HTTP response is deliberately immediate: Termux has a five-second
+        timeout, while WhatsApp delivery and all later accounting work are
+        independent of the POST request.
+        """
+        processor = self._mmp_sms_processor
+        if processor is None:
+            return web.json_response({"error": "MMP SMS webhook disabled"}, status=404)
+        remote = request.remote or ""
+        if not processor.accepts_ip(remote):
+            logger.warning("[mmp-sms] rejected source IP %s", remote)
+            return web.json_response({"error": "Source IP not allowed"}, status=403)
+        if (request.content_length or 0) > self._max_body_bytes:
+            return web.json_response({"error": "Payload too large"}, status=413)
+        try:
+            payload = await request.json()
+        except Exception:
+            return web.json_response({"error": "Invalid JSON"}, status=400)
+
+        async def _process() -> None:
+            try:
+                candidate = await asyncio.to_thread(processor.prepare, payload)
+                action = await asyncio.to_thread(processor.apply_policy, candidate)
+                if action == "preview":
+                    await processor.send_preview(candidate, self.gateway_runner)
+                elif action == "auto":
+                    await processor.send_notice(candidate, self.gateway_runner)
+            except Exception:
+                logger.exception("[mmp-sms] asynchronous SMS processing failed")
+
+        task = asyncio.create_task(_process())
+        self._background_tasks.add(task)
+        task.add_done_callback(self._background_tasks.discard)
+        return web.json_response({"ok": True}, status=200)
 
     def _reload_dynamic_routes(self) -> None:
         """Reload agent-created subscriptions from disk if the file changed."""

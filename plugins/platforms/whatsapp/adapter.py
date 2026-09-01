@@ -1392,6 +1392,8 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
                                 # delay message dispatch (matches BlueBubbles
                                 # asyncio.create_task pattern for mark_read).
                                 asyncio.create_task(self._send_read_receipt(msg_data))
+                                if await self._handle_mmp_sms_control(event):
+                                    continue
                                 if event.message_type == MessageType.TEXT:
                                     self._enqueue_text_event(event)
                                 else:
@@ -1407,6 +1409,40 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
                 await asyncio.sleep(5)
             
             await asyncio.sleep(1)  # Poll interval
+
+    async def _handle_mmp_sms_control(self, event: MessageEvent) -> bool:
+        """Consume explicit SMS confirmation commands before normal chat dispatch."""
+        if event.message_type != MessageType.TEXT:
+            return False
+        runner = getattr(self, "gateway_runner", None)
+        webhook_adapter = None
+        if runner is not None:
+            try:
+                from gateway.config import Platform
+                webhook_adapter = runner.adapters.get(Platform.WEBHOOK)
+            except Exception:
+                webhook_adapter = None
+        processor = getattr(webhook_adapter, "_mmp_sms_processor", None)
+        if processor is None:
+            return False
+        control = processor.classify_control(event.text)
+        if control is None:
+            return False
+        action, candidate_id = control
+        from gateway.mmp_sms_webhook import notify_confirmation_result
+        task = asyncio.create_task(
+            notify_confirmation_result(
+                processor,
+                action,
+                candidate_id,
+                runner,
+                event.source.chat_id,
+            )
+        )
+        # Keep the task alive independently of the polling iteration.
+        task.add_done_callback(lambda done: done.exception() if not done.cancelled() else None)
+        logger.info("[mmp-sms] consumed WhatsApp control %s %s", action, candidate_id)
+        return True
 
     async def _send_read_receipt(self, data: Dict[str, Any]) -> None:
         """Mark a policy-accepted inbound message as read via the bridge."""

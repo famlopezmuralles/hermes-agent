@@ -3,6 +3,9 @@
 </p>
 
 # Hermes Agent ☤
+
+> **Fork notice:** this is [`famlopezmuralles/hermes-agent`](https://github.com/famlopezmuralles/hermes-agent), not Nous upstream. linux25/`hermes1` runs this checkout. See [FORK.md](FORK.md).
+
 <p align="center">
   <a href="https://hermes-agent.nousresearch.com/">Hermes Agent</a> | <a href="https://hermes-agent.nousresearch.com/">Hermes Desktop</a>
 </p>
