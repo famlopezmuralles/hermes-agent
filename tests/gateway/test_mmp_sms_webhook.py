@@ -174,11 +174,34 @@ def test_aiohttp_route_returns_200_and_queues_preview(tmp_path):
     pending = adapter._mmp_sms_processor._read_pending()
     assert pending
     candidate = next(iter(pending.values()))
-    # Clear PUMA purchase is auto-written; preview is only for needs_review.
-    assert candidate.get("disposition") == "auto"
-    assert sent == []
+    assert candidate.get("status") == "queued_for_agent"
+    assert candidate.get("body")
     journal = (repo / "Y26" / "journal" / "mcblack.Y26.M8.journal").read_text(encoding="utf-8")
-    assert "liabilities:tc:mcblack:saldo    -300.00 Q" in journal
+    assert "300.00 Q" not in journal
+
+
+def test_ingest_raw_does_not_parse_gtc_sporta(tmp_path):
+    repo = _copy_repo(tmp_path)
+    processor = MmpSmsWebhookProcessor(
+        {"mmp_repo": str(repo), "pending_path": str(tmp_path / "pending.json")}
+    )
+    raw = processor.ingest_raw(
+        {
+            "type": "sms_transaction_notification",
+            "user": "carlos",
+            "sender": "50254001718",
+            "body": "BANCO GTC: Consumo tarjeta credito con la cuenta 7664  No. autorizacion: 00088542  Monto: Q. 820.00 Localidad: SPORTA GUATEMALA         GUATEMALA    GT",
+            "receivedAt": "2026-08-31 16:30:23",
+            "source": "termux-sms",
+        }
+    )
+    assert raw["status"] == "queued_for_agent"
+    assert "SPORTA GUATEMALA" in raw["body"]
+    assert "account" not in raw or raw.get("account") is None
+    prompt = processor.llm_prompt([raw])
+    assert "TÚ parseas" in prompt
+    assert "SPORTA GUATEMALA" in prompt
+    assert "cuenta 7664" in prompt
 
 
 def test_otp_and_transfers_are_ignored(tmp_path):
