@@ -1,14 +1,12 @@
 """MoneyManagerPlus SMS capture flow for the Hermes webhook adapter.
 
-The transport is intentionally narrow:
+Transport only on the Python side:
 - accept the LAN SMS contract;
-- parse only facts that can be extracted deterministically;
-- canonicalize merchants from MoneyManagerPlus/CLAUDE.md at runtime;
-- ignore OTP / login / promo / non-purchase movements (no WhatsApp);
-- auto-write card purchases that parse cleanly (amount + known merchant + card);
-- ask WhatsApp ``CONFIRMAR <id>`` only for real purchases that still need review.
+- dedupe by (sender, body, receivedAt);
+- hand the raw SMS to the Hermes LLM (WhatsApp delivery).
 
-No LLM is involved in the ingest path.
+The LLM parses bank formats, canonicalizes merchants, writes the journal,
+and reports budget execution. Do not add bank-specific regex here.
 """
 
 from __future__ import annotations
@@ -330,6 +328,94 @@ class MmpSmsWebhookProcessor:
                     data.pop(key, None)
             except Exception:
                 data.pop(key, None)
+
+    def ingest_raw(self, payload: dict[str, Any]) -> dict[str, Any]:
+        """Validate + dedupe only. No bank parsing — that is the LLM's job."""
+        if not isinstance(payload, dict):
+            raise ValueError("JSON payload must be an object")
+        for key, expected in _REQUIRED_FIELDS.items():
+            if payload.get(key) != expected:
+                raise ValueError(f"Invalid {key}; expected {expected!r}")
+        for key in ("sender", "body", "receivedAt"):
+            if not isinstance(payload.get(key), str) or not payload[key].strip():
+                raise ValueError(f"Missing or invalid {key}")
+        body = payload["body"]
+        fingerprint = hashlib.sha256(
+            json.dumps(
+                {"sender": payload["sender"], "body": body, "receivedAt": payload["receivedAt"]},
+                sort_keys=True,
+            ).encode()
+        ).hexdigest()[:16]
+        candidate_id = f"SMS-{fingerprint[:8]}"
+        candidate = {
+            "id": candidate_id,
+            "fingerprint": fingerprint,
+            "created_at": datetime.now(timezone.utc).isoformat(),
+            "received_at": payload["receivedAt"],
+            "sender": payload["sender"],
+            "body": body,
+            "status": "queued_for_agent",
+        }
+        with self._lock:
+            pending = self._read_pending()
+            self._prune(pending, datetime.now(timezone.utc))
+            for existing in pending.values():
+                if existing.get("fingerprint") == fingerprint:
+                    if existing.get("status") in {"pending", "needs_review"}:
+                        existing["status"] = "queued_for_agent"
+                        self._write_pending(pending)
+                    return existing
+            pending[candidate_id] = candidate
+            self._write_pending(pending)
+        return candidate
+
+    def mark_agent_dispatched(self, item_ids: list[str]) -> None:
+        with self._lock:
+            pending = self._read_pending()
+            now = datetime.now(timezone.utc).isoformat()
+            changed = False
+            for item_id in item_ids:
+                item = pending.get(item_id)
+                if item and item.get("status") == "queued_for_agent":
+                    item["status"] = "agent_dispatched"
+                    item["dispatched_at"] = now
+                    changed = True
+            if changed:
+                self._write_pending(pending)
+
+    def llm_prompt(self, items: list[dict[str, Any]]) -> str:
+        blocks = []
+        for item in items:
+            blocks.append(
+                f"- id={item.get('id')} received={item.get('received_at')} from={item.get('sender')}\n"
+                f"  {item.get('body')}"
+            )
+        listing = "\n".join(blocks)
+        return (
+            "SMS bancarios nuevos (Termux → MMPlus). TÚ parseas el texto. "
+            "No uses ni asumas un parser Python de bancos.\n\n"
+            f"Repo journal: {self.repo}\n"
+            "Escribe en Y26/journal/<cuenta>.Y26.M<n>.journal del ciclo correcto "
+            "(cutoff_day en config/account_map.yaml). "
+            "Si git está en otra rama, igual escribe el posting y reporta el error de git.\n\n"
+            "Reglas:\n"
+            "1. Ignora OTP, login, promos, marketing, débitos/créditos entre cuentas propias sin comercio.\n"
+            "2. Compras/consumos: banco, últimos 4, monto, moneda, comercio, fecha.\n"
+            "   GTC: 'Consumo tarjeta credito con la cuenta NNNN … Monto: Q. X Localidad: MERCHANT'\n"
+            "   Promerica: 'Consumo PROMERICA **NNNN Monto … Comercio …'\n"
+            "   Ficohsa: 'FICOAVISO: Transaccion TC xxNNNN por Q X en MERCHANT'\n"
+            "   BI: 'BiMovil: Consumo por Q.X en MERCHANT Cuenta TCREDITO'\n"
+            "3. Canonicaliza comercio con CLAUDE.md (Merchant synonyms). "
+            "Si no está, needs_review — no inventes categoría.\n"
+            "4. Compras claras: escribe el posting YA. No pidas CONFIRMAR uno por uno.\n"
+            "5. Dudosas: un solo WhatsApp con el lote.\n"
+            "6. Tras escribir: % ejecutado del presupuesto del mes; si es variable "
+            "(gasolina/transporte/super) también % de la semana. Alerta si excedido.\n"
+            f"   API: {self.budget_api_url}/api/budget/month/YYYY-MM?currencyMode=GTQ\n"
+            "7. No dupliques si el asiento ya existe.\n"
+            "8. Responde en WhatsApp el resumen. Si TODO el lote es ignore, no hace falta mensaje.\n\n"
+            f"SMS ({len(items)}):\n{listing}\n"
+        )
 
     def prepare(self, payload: dict[str, Any]) -> dict[str, Any]:
         if not isinstance(payload, dict):

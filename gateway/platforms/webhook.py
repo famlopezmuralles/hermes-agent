@@ -247,6 +247,8 @@ class WebhookAdapter(BasePlatformAdapter):
             if isinstance(mmp_sms_config, dict) and mmp_sms_config.get("enabled", False)
             else None
         )
+        self._mmp_sms_batch: list = []
+        self._mmp_sms_flush_task = None
 
     # ------------------------------------------------------------------
     # Lifecycle
@@ -536,12 +538,17 @@ class WebhookAdapter(BasePlatformAdapter):
 
         async def _process() -> None:
             try:
-                candidate = await asyncio.to_thread(processor.prepare, payload)
-                action = await asyncio.to_thread(processor.apply_policy, candidate)
-                if action == "preview":
-                    await processor.send_preview(candidate, self.gateway_runner)
-                elif action == "auto":
-                    await processor.send_notice(candidate, self.gateway_runner)
+                raw = await asyncio.to_thread(processor.ingest_raw, payload)
+                if raw.get("status") != "queued_for_agent":
+                    logger.info("[mmp-sms] skip dispatch id=%s status=%s", raw.get("id"), raw.get("status"))
+                    return
+                self._mmp_sms_batch.append(raw)
+                if self._mmp_sms_flush_task is not None:
+                    self._mmp_sms_flush_task.cancel()
+                task = asyncio.create_task(self._flush_mmp_sms_batch())
+                self._mmp_sms_flush_task = task
+                self._background_tasks.add(task)
+                task.add_done_callback(self._background_tasks.discard)
             except Exception:
                 logger.exception("[mmp-sms] asynchronous SMS processing failed")
 
@@ -549,6 +556,56 @@ class WebhookAdapter(BasePlatformAdapter):
         self._background_tasks.add(task)
         task.add_done_callback(self._background_tasks.discard)
         return web.json_response({"ok": True}, status=200)
+
+    async def _flush_mmp_sms_batch(self) -> None:
+        """Debounce a Termux poll burst into one LLM turn."""
+        try:
+            await asyncio.sleep(8)
+        except asyncio.CancelledError:
+            return
+        processor = self._mmp_sms_processor
+        items = list(self._mmp_sms_batch)
+        self._mmp_sms_batch = []
+        self._mmp_sms_flush_task = None
+        if not items or processor is None:
+            return
+        try:
+            await self._dispatch_mmp_sms_to_agent(items)
+        except Exception:
+            logger.exception("[mmp-sms] LLM dispatch failed ids=%s", [i.get("id") for i in items])
+
+    async def _dispatch_mmp_sms_to_agent(self, items: list) -> None:
+        processor = self._mmp_sms_processor
+        prompt = processor.llm_prompt(items)
+        delivery_id = items[0]["id"] if len(items) == 1 else f"batch-{items[-1]['id']}"
+        session_chat_id = f"webhook:mmp-sms:{delivery_id}"
+        now = time.time()
+        chat_id = processor.chat_id
+        extra = {"chat_id": chat_id} if chat_id else {}
+        self._delivery_info[session_chat_id] = {
+            "deliver": "whatsapp",
+            "deliver_extra": extra,
+        }
+        self._delivery_info_created[session_chat_id] = now
+        self._delivery_info_order.append((now, session_chat_id))
+        self._prune_delivery_info(now)
+        source = self.build_source(
+            chat_id=session_chat_id,
+            chat_name="webhook/mmp-sms",
+            chat_type="webhook",
+            user_id="webhook:mmp-sms",
+            user_name="mmp-sms",
+        )
+        event = MessageEvent(
+            text=prompt,
+            message_type=MessageType.TEXT,
+            source=source,
+            raw_message={"items": items},
+            message_id=delivery_id,
+        )
+        logger.info("[mmp-sms] dispatching %d SMS to LLM delivery=%s", len(items), delivery_id)
+        await self.handle_message(event)
+        await asyncio.to_thread(processor.mark_agent_dispatched, [i["id"] for i in items])
 
     def _reload_dynamic_routes(self) -> None:
         """Reload agent-created subscriptions from disk if the file changed."""
