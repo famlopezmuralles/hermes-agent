@@ -1,9 +1,10 @@
 name: mmp-sms
 label: MMPlus SMS
 kind: platform
-version: "1.0.0"
+version: "1.1.0"
 description: >
   MoneyManagerPlus Termux SMS ingest. Python is transport and dedupe only;
   Hermes LLM parses bank formats, writes the journal, and reports budget
-  execution on WhatsApp.
+  execution on WhatsApp. Complete receipts can be retained in an append-only
+  JSONL history with per-user opt-out; see README.md.
 author: Carlos Lopez

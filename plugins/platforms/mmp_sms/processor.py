@@ -15,6 +15,7 @@ import asyncio
 import hashlib
 import json
 import logging
+import os
 import re
 import subprocess
 import threading
@@ -288,6 +289,24 @@ class MmpSmsWebhookProcessor:
             pending_path = get_hermes_home() / "mmp_sms_pending.json"
         self.pending_path: Path = pending_path
         self.pending_path.parent.mkdir(parents=True, exist_ok=True)
+        history = config.get("history")
+        if not isinstance(history, dict):
+            history = {}
+        self.history_enabled = bool(history.get("enabled", True))
+        disabled_users = history.get("disabled_users", [])
+        if isinstance(disabled_users, str):
+            disabled_users = [disabled_users]
+        self.history_disabled_users = (
+            {str(user).strip().casefold() for user in disabled_users if str(user).strip()}
+            if isinstance(disabled_users, list)
+            else set()
+        )
+        if history.get("path"):
+            history_path = Path(str(history["path"])).expanduser()
+        else:
+            from hermes_constants import get_hermes_home
+            history_path = get_hermes_home() / "mmp_sms" / "sms-history.jsonl"
+        self.history_path = history_path
         raw_ips = config.get("allowed_ips")
         if isinstance(raw_ips, str):
             try:
@@ -329,6 +348,46 @@ class MmpSmsWebhookProcessor:
             except Exception:
                 data.pop(key, None)
 
+    def _history_enabled_for(self, user: str) -> bool:
+        return self.history_enabled and user.casefold() not in self.history_disabled_users
+
+    def _append_history(
+        self,
+        payload: dict[str, Any],
+        candidate: dict[str, Any],
+        *,
+        duplicate: bool,
+    ) -> None:
+        """Append one complete receipt before the gateway acknowledges it."""
+        user = str(payload["user"])
+        if not self._history_enabled_for(user):
+            return
+        record = {
+            "event": "sms_received",
+            "id": candidate["id"],
+            "fingerprint": candidate["fingerprint"],
+            "duplicate": duplicate,
+            "user": user,
+            "sender": payload["sender"],
+            "body": payload["body"],
+            "receivedAt": payload["receivedAt"],
+            "source": payload["source"],
+            "ingestedAt": datetime.now(timezone.utc).isoformat(),
+        }
+        encoded = (json.dumps(record, ensure_ascii=False, sort_keys=True) + "\n").encode("utf-8")
+        self.history_path.parent.mkdir(parents=True, exist_ok=True)
+        flags = os.O_WRONLY | os.O_CREAT | os.O_APPEND
+        flags |= getattr(os, "O_NOFOLLOW", 0)
+        fd = os.open(self.history_path, flags, 0o600)
+        try:
+            os.fchmod(fd, 0o600)
+            view = memoryview(encoded)
+            while view:
+                view = view[os.write(fd, view):]
+            os.fsync(fd)
+        finally:
+            os.close(fd)
+
     def ingest_raw(self, payload: dict[str, Any]) -> dict[str, Any]:
         """Validate + dedupe only. No bank parsing — that is the LLM's job."""
         if not isinstance(payload, dict):
@@ -361,10 +420,12 @@ class MmpSmsWebhookProcessor:
             self._prune(pending, datetime.now(timezone.utc))
             for existing in pending.values():
                 if existing.get("fingerprint") == fingerprint:
+                    self._append_history(payload, existing, duplicate=True)
                     if existing.get("status") in {"pending", "needs_review"}:
                         existing["status"] = "queued_for_agent"
                         self._write_pending(pending)
                     return existing
+            self._append_history(payload, candidate, duplicate=False)
             pending[candidate_id] = candidate
             self._write_pending(pending)
         return candidate
