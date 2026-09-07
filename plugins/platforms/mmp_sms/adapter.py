@@ -108,27 +108,27 @@ class MmpSmsAdapter(BasePlatformAdapter):
         except Exception:
             return web.json_response({"error": "Invalid JSON"}, status=400)
 
-        async def _process() -> None:
-            try:
-                raw = await asyncio.to_thread(self._processor.ingest_raw, payload)
-                if raw.get("status") != "queued_for_agent":
-                    logger.info(
-                        "[mmp-sms] skip dispatch id=%s status=%s",
-                        raw.get("id"),
-                        raw.get("status"),
-                    )
-                    return
-                self._batch.append(raw)
-                if self._flush_task is not None:
-                    self._flush_task.cancel()
-                task = asyncio.create_task(self._flush_batch())
-                self._flush_task = task
-                self._background_tasks.add(task)
-                task.add_done_callback(self._background_tasks.discard)
-            except Exception:
-                logger.exception("[mmp-sms] ingest failed")
-
-        task = asyncio.create_task(_process())
+        try:
+            # Persist the full receipt before acknowledging HTTP 200. Dispatch
+            # remains asynchronous, but receipt durability is not.
+            raw = await asyncio.to_thread(self._processor.ingest_raw, payload)
+        except ValueError as exc:
+            return web.json_response({"error": str(exc)}, status=400)
+        except Exception:
+            logger.exception("[mmp-sms] durable ingest failed")
+            return web.json_response({"error": "SMS persistence failed"}, status=503)
+        if raw.get("status") != "queued_for_agent":
+            logger.info(
+                "[mmp-sms] skip dispatch id=%s status=%s",
+                raw.get("id"),
+                raw.get("status"),
+            )
+            return web.json_response({"ok": True})
+        self._batch.append(raw)
+        if self._flush_task is not None:
+            self._flush_task.cancel()
+        task = asyncio.create_task(self._flush_batch())
+        self._flush_task = task
         self._background_tasks.add(task)
         task.add_done_callback(self._background_tasks.discard)
         return web.json_response({"ok": True}, status=200)

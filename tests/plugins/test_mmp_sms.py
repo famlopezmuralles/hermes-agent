@@ -1,5 +1,7 @@
 import asyncio
+import json
 from pathlib import Path
+import socket
 import subprocess
 from types import SimpleNamespace
 
@@ -34,6 +36,107 @@ def _payload(body="Compra en PUMA ENERGY GT LA FRON por Q 300.00 tarjeta termina
         "receivedAt": "2026-08-26T18:00:00.000Z",
         "source": "termux-sms",
     }
+
+
+def test_ingest_raw_persists_complete_sms_history_record(tmp_path):
+    repo = _copy_repo(tmp_path)
+    history = tmp_path / "history" / "sms-history.jsonl"
+    payload = _payload("FICOAVISO: Transaccion TC xx0124 por Q 155.65 en PRICESMART FRAIJANES")
+    processor = MmpSmsWebhookProcessor(
+        {
+            "mmp_repo": str(repo),
+            "pending_path": str(tmp_path / "pending.json"),
+            "history": {"path": str(history)},
+        }
+    )
+
+    candidate = processor.ingest_raw(payload)
+
+    records = [json.loads(line) for line in history.read_text(encoding="utf-8").splitlines()]
+    assert len(records) == 1
+    assert records[0]["event"] == "sms_received"
+    assert records[0]["id"] == candidate["id"]
+    assert records[0]["user"] == "carlos"
+    assert records[0]["sender"] == payload["sender"]
+    assert records[0]["body"] == payload["body"]
+    assert records[0]["receivedAt"] == payload["receivedAt"]
+    assert records[0]["source"] == payload["source"]
+    assert records[0]["duplicate"] is False
+    assert history.stat().st_mode & 0o777 == 0o600
+
+
+def test_history_records_duplicate_receipts_without_losing_the_body(tmp_path):
+    repo = _copy_repo(tmp_path)
+    history = tmp_path / "sms-history.jsonl"
+    processor = MmpSmsWebhookProcessor(
+        {
+            "mmp_repo": str(repo),
+            "pending_path": str(tmp_path / "pending.json"),
+            "history": {"path": str(history)},
+        }
+    )
+
+    processor.ingest_raw(_payload("Compra en PUMA ENERGY por Q 300.00"))
+    processor.ingest_raw(_payload("Compra en PUMA ENERGY por Q 300.00"))
+
+    records = [json.loads(line) for line in history.read_text(encoding="utf-8").splitlines()]
+    assert len(records) == 2
+    assert records[0]["duplicate"] is False
+    assert records[1]["duplicate"] is True
+    assert records[0]["body"] == records[1]["body"]
+
+
+def test_history_can_be_disabled_for_a_specific_user(tmp_path):
+    repo = _copy_repo(tmp_path)
+    history = tmp_path / "sms-history.jsonl"
+    processor = MmpSmsWebhookProcessor(
+        {
+            "mmp_repo": str(repo),
+            "pending_path": str(tmp_path / "pending.json"),
+            "history": {"path": str(history), "disabled_users": ["carlos"]},
+        }
+    )
+
+    processor.ingest_raw(_payload())
+
+    assert history.exists() is False
+
+
+def test_webhook_does_not_ack_when_durable_ingest_fails(tmp_path):
+    repo = _copy_repo(tmp_path)
+    with socket.socket() as probe:
+        probe.bind(("127.0.0.1", 0))
+        free_port = probe.getsockname()[1]
+    config = PlatformConfig.from_dict(
+        {
+            "enabled": True,
+            "extra": {
+                "host": "127.0.0.1",
+                "port": free_port,
+                "mmp_repo": str(repo),
+                "pending_path": str(tmp_path / "pending.json"),
+                "allowed_ips": ["127.0.0.1"],
+            },
+        }
+    )
+    adapter = MmpSmsAdapter(config)
+    adapter.gateway_runner = SimpleNamespace(adapters={})
+
+    def fail_ingest(_payload):
+        raise OSError("disk full")
+
+    adapter._processor.ingest_raw = fail_ingest
+
+    async def exercise():
+        assert await adapter.connect() is True
+        port = adapter._runner.addresses[0][1]
+        async with aiohttp.ClientSession() as session:
+            async with session.post(f"http://127.0.0.1:{port}/webhook", json=_payload()) as response:
+                assert response.status == 503
+                assert await response.json() == {"error": "SMS persistence failed"}
+        await adapter.disconnect()
+
+    asyncio.run(exercise())
 
 
 def test_prepare_uses_live_dictionary_and_routes_cycle(tmp_path):
@@ -136,12 +239,15 @@ def test_confirm_refuses_protected_main_branch(tmp_path):
 
 def test_aiohttp_route_returns_200_and_queues_preview(tmp_path):
     repo = _copy_repo(tmp_path)
+    with socket.socket() as probe:
+        probe.bind(("127.0.0.1", 0))
+        free_port = probe.getsockname()[1]
     config = PlatformConfig.from_dict(
         {
             "enabled": True,
             "extra": {
                 "host": "127.0.0.1",
-                "port": 0,
+                "port": free_port,
                 "mmp_repo": str(repo),
                 "pending_path": str(tmp_path / "pending.json"),
                 "allowed_ips": ["127.0.0.1"],
